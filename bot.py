@@ -31,15 +31,36 @@ TG = f"https://api.telegram.org/bot{TG_TOKEN}"
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
 
+BTN_LIST = "📋 Мої звуки"
+BTN_CHECK = "🔄 Перевірити зараз"
+BTN_ADD = "➕ Додати звук"
+BTN_HELP = "❓ Як це працює"
+BTN_FREQ = "⚙️ Налаштування"
+
+MENU = {"keyboard": [[{"text": BTN_LIST}, {"text": BTN_CHECK}],
+                     [{"text": BTN_ADD}, {"text": BTN_FREQ}],
+                     [{"text": BTN_HELP}]],
+        "resize_keyboard": True, "is_persistent": True}
+
 HELP = (
-    "🎵 <b>Бот стежить за твоїми звуками в TikTok</b>\n\n"
-    "Просто кинь посилання на звук (сторінка /music/...) — і я його додам.\n\n"
-    "/list — список звуків\n"
-    "/remove 2 — прибрати звук №2\n"
-    "/name 2 Цвіте Терен — назвати звук №2\n"
-    "/check — перевірити зараз\n"
-    "/help — ця підказка\n\n"
-    f"Перевіряю нові відео кожні {SCAN_EVERY_HOURS:g} год."
+    "🎵 <b>Я стежу за твоїми звуками в TikTok</b> і присилаю кожне нове відео під ними.\n\n"
+    "<b>Кнопки внизу:</b>\n"
+    f"{BTN_LIST} — список звуків, там же перейменувати чи видалити\n"
+    f"{BTN_CHECK} — перевірити всі звуки прямо зараз\n"
+    f"{BTN_ADD} — як додати новий звук\n"
+    f"{BTN_FREQ} — як часто перевіряти і до скількох відео стежити за звуком\n\n"
+    "Коли під звуком стає більше відео, ніж ліміт, я перестаю за ним стежити — "
+    "щоб не витрачати гроші на вже розкручені звуки.\n"
+    "⏳ Відповідаю не миттєво, а протягом кількох хвилин — я прокидаюсь за розкладом."
+)
+
+ADD_HOWTO = (
+    "<b>Як додати звук:</b>\n"
+    "1. Відкрий у TikTok будь-яке відео з твоїм звуком\n"
+    "2. Тисни на крутний диск справа внизу\n"
+    "3. Стрілочка «Поділитись» → «Копіювати посилання»\n"
+    "4. Встав посилання сюди\n\n"
+    "Кілька звуків — кожне посилання окремим повідомленням."
 )
 
 
@@ -54,6 +75,11 @@ def load_state():
     st.setdefault("tg_offset", 0)
     st.setdefault("sounds", {})
     st.setdefault("last_scan", 0)
+    st.setdefault("scan_hours", SCAN_EVERY_HOURS)
+    st.setdefault("max_videos", 300)
+    for mid, snd in st["sounds"].items():
+        if snd.get("title") == mid:
+            snd["title"] = ""
     return st
 
 
@@ -64,21 +90,30 @@ def save_state(st):
 
 # ---------------------------------------------------------------- telegram
 
-def send(text, preview=False):
+def tg(method, payload):
     for _ in range(5):
-        r = requests.post(f"{TG}/sendMessage", json={
-            "chat_id": CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": not preview,
-        }, timeout=30)
+        try:
+            r = requests.post(f"{TG}/{method}", json=payload, timeout=30)
+        except requests.RequestException as e:
+            print("telegram error:", e)
+            time.sleep(2)
+            continue
         if r.status_code == 429:
             time.sleep(r.json().get("parameters", {}).get("retry_after", 3) + 1)
             continue
         if not r.ok:
-            print("telegram error:", r.status_code, r.text[:300])
+            print("telegram error:", method, r.status_code, r.text[:300])
         time.sleep(0.4)
-        return
+        return r
+    return None
+
+
+def send(text, preview=False, markup=None):
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+               "disable_web_page_preview": not preview}
+    if markup:
+        payload["reply_markup"] = markup
+    tg("sendMessage", payload)
 
 
 def esc(s):
@@ -112,84 +147,148 @@ def extract_music_id(text):
 
 # ---------------------------------------------------------------- commands
 
-def sound_list(st):
-    return list(st["sounds"].items())
+def name_of(mid, s):
+    return s.get("title") or f"Звук {mid[-6:]}"
+
+
+def send_list(st):
+    items = list(st["sounds"].items())
+    if not items:
+        send("Поки що звуків немає.\n\n" + ADD_HOWTO, markup=MENU)
+        return
+    lines, buttons = [], []
+    for i, (mid, s) in enumerate(items, 1):
+        cnt = s.get("count") or len(s.get("seen", []))
+        status = (f"понад {cnt - 1} відео, ⏸ не стежу" if s.get("paused")
+                  else f"{cnt} відео, 🟢 стежу")
+        lines.append(f"{i}. <b>{esc(name_of(mid, s))}</b> — {status}\n"
+                     f"   https://www.tiktok.com/music/x-{mid}")
+        buttons.append([{"text": f"✏️ {i}. Назвати", "callback_data": f"ren:{mid}"},
+                        {"text": f"🗑 {i}. Видалити", "callback_data": f"del:{mid}"}])
+    send("🎵 <b>Твої звуки:</b>\n\n" + "\n".join(lines),
+         markup={"inline_keyboard": buttons})
+
+
+def send_freq(st):
+    h, lim = st["scan_hours"], st["max_videos"]
+    vids = sum(min(x.get("count") or lim, lim + 1)
+               for x in st["sounds"].values() if not x.get("paused"))
+    month = vids * (24 / h) * 30 * 0.25 / 1000
+    hours = [{"text": f"{'✅ ' if h == v else ''}{v:g} год", "callback_data": f"freq:{v:g}"}
+             for v in (12, 24, 48)]
+    limits = [{"text": f"{'✅ ' if lim == v else ''}до {v}", "callback_data": f"lim:{v}"}
+              for v in (100, 300, 500, 1000)]
+    send("⚙️ <b>Налаштування</b>\n\n"
+         f"Перевіряю раз на <b>{h:g} год</b>\n"
+         f"Стежу за звуком, поки під ним до <b>{lim} відео</b>\n\n"
+         f"Зараз це ~${month:.1f}/міс в Apify (безкоштовно дають $5)\n\n"
+         "Верхній ряд — як часто, нижній — до скількох відео:",
+         markup={"inline_keyboard": [hours, limits]})
+
+
+def handle_callback(st, cq):
+    """Inline button press. Returns list of sound ids to scan now."""
+    tg("answerCallbackQuery", {"callback_query_id": cq["id"]})
+    if str(cq.get("from", {}).get("id")) != CHAT_ID:
+        return []
+    action, _, mid = (cq.get("data") or "").partition(":")
+    if action == "freq":
+        st["scan_hours"] = float(mid)
+        send(f"⚙️ Готово: перевіряю раз на <b>{mid} год</b>.", markup=MENU)
+        return []
+    if action == "lim":
+        st["max_videos"] = int(mid)
+        back = [k for k, x in st["sounds"].items()
+                if x.get("paused") and x.get("count", 0) < int(mid)]
+        for k in back:
+            st["sounds"][k]["paused"] = False
+        send(f"⚙️ Готово: стежу за звуками до <b>{mid} відео</b>."
+             + (f"\nЗнову стежу за {len(back)} звук(ами)." if back else ""), markup=MENU)
+        return back
+    s = st["sounds"].get(mid)
+    if not s:
+        send("Цього звуку вже немає в списку.", markup=MENU)
+    elif action == "ren":
+        st["pending_name"] = mid
+        send(f"Напиши, як назвати <b>{esc(name_of(mid, s))}</b> (наприклад: Цвіте Терен)")
+    elif action == "del":
+        send(f"Точно прибрати <b>{esc(name_of(mid, s))}</b>?", markup={"inline_keyboard": [[
+            {"text": "Так, видалити", "callback_data": f"delok:{mid}"},
+            {"text": "Ні", "callback_data": f"no:{mid}"}]]})
+    elif action == "delok":
+        st["sounds"].pop(mid)
+        send(f"🗑 Прибрав: {esc(name_of(mid, s))}", markup=MENU)
+    elif action == "no":
+        send("Ок, залишаю.", markup=MENU)
+    return []
 
 
 def handle_commands(st):
-    """Processes new Telegram messages. Returns True if a scan should run now."""
-    force = False
+    """Processes new Telegram updates. Returns (full_scan, [sound ids to scan])."""
+    full, only = False, []
     try:
         r = requests.get(f"{TG}/getUpdates",
                          params={"offset": st["tg_offset"], "timeout": 0}, timeout=30)
         updates = r.json().get("result", [])
     except (requests.RequestException, ValueError) as e:
         print("getUpdates failed:", e)
-        return False
+        return False, []
 
     for upd in updates:
         st["tg_offset"] = upd["update_id"] + 1
+        if upd.get("callback_query"):
+            only += handle_callback(st, upd["callback_query"])
+            continue
         msg = upd.get("message") or upd.get("edited_message")
         if not msg or str(msg.get("chat", {}).get("id")) != CHAT_ID:
             continue
         text = (msg.get("text") or "").strip()
-        cmd = text.split()[0].split("@")[0].lower() if text else ""
+        cmd = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
+        pending = st.pop("pending_name", None)
 
-        if cmd in ("/start", "/help"):
-            send(HELP)
+        if cmd == "/start" or cmd == "/help" or text == BTN_HELP:
+            send(HELP, markup=MENU)
 
-        elif cmd == "/list":
-            items = sound_list(st)
-            if not items:
-                send("Поки що звуків немає. Кинь посилання на звук.")
-            else:
-                lines = [f"{i}. {esc(s.get('title') or mid)} — {len(s.get('seen', []))} відео"
-                         for i, (mid, s) in enumerate(items, 1)]
-                send("🎵 <b>Звуки:</b>\n" + "\n".join(lines))
+        elif cmd == "/list" or text == BTN_LIST:
+            send_list(st)
 
-        elif cmd == "/remove":
-            arg = text[len("/remove"):].strip()
-            items = sound_list(st)
-            mid = None
-            if arg.isdigit() and 1 <= int(arg) <= len(items):
-                mid = items[int(arg) - 1][0]
-            elif arg in st["sounds"]:
-                mid = arg
-            if mid:
-                title = st["sounds"].pop(mid).get("title") or mid
-                send(f"Прибрав: {esc(title)}")
-            else:
-                send("Вкажи номер зі списку: /remove 2")
+        elif cmd == "/check" or text == BTN_CHECK:
+            send("🔄 Перевіряю всі звуки… Нові відео прийдуть за кілька хвилин.", markup=MENU)
+            full = True
 
-        elif cmd == "/name":
+        elif cmd == "/freq" or text == BTN_FREQ:
+            send_freq(st)
+
+        elif cmd == "/add" or text == BTN_ADD:
+            send(ADD_HOWTO, markup=MENU)
+
+        elif cmd == "/name":  # old style: /name 2 Цвіте Терен
             parts = text.split(maxsplit=2)
-            items = sound_list(st)
+            items = list(st["sounds"])
             if len(parts) == 3 and parts[1].isdigit() and 1 <= int(parts[1]) <= len(items):
-                mid = items[int(parts[1]) - 1][0]
-                st["sounds"][mid]["title"] = parts[2].strip()[:80]
-                send(f"Звук №{parts[1]} тепер: {esc(parts[2].strip())}")
+                st["sounds"][items[int(parts[1]) - 1]]["title"] = parts[2].strip()[:80]
+                send(f"✏️ Готово: {esc(parts[2].strip())}", markup=MENU)
             else:
-                send("Напиши так: /name 2 Цвіте Терен")
-
-        elif cmd == "/check":
-            send("Перевіряю…")
-            force = True
+                send_list(st)
 
         else:
-            mid = extract_music_id(text)
+            mid = extract_music_id(text) if "tiktok" in text or text.isdigit() else None
             if mid and mid in st["sounds"]:
-                send("Цей звук вже відстежую.")
+                send("Цей звук вже відстежую.", markup=MENU)
             elif mid:
                 st["sounds"][mid] = {"title": "", "seen": [], "since": 0}
-                send("✅ Додав звук. Зараз запам'ятаю, що під ним вже є, "
-                     "а далі присилатиму тільки нові відео.")
-                force = True
-            elif text.startswith("/add") or "tiktok.com" in text:
-                send("Не бачу тут посилання на звук. Відкрий відео → тисни на "
-                     "крутний диск справа внизу → поділись посиланням на звук.")
+                st["pending_name"] = mid
+                send("✅ <b>Додав звук!</b> Зараз подивлюсь, які відео під ним вже є.\n\n"
+                     "Як його назвати? Напиши назву (наприклад: Цвіте Терен)", markup=MENU)
+                only.append(mid)
+            elif "tiktok" in text:
+                send("Не бачу тут посилання на звук 🤔\n\n" + ADD_HOWTO, markup=MENU)
+            elif pending and pending in st["sounds"] and text and not cmd:
+                st["sounds"][pending]["title"] = text[:80]
+                send(f"✏️ Назвав: <b>{esc(text[:80])}</b>", markup=MENU)
             else:
-                send(HELP)
-    return force
+                send(HELP, markup=MENU)
+    return full, only
 
 
 # ---------------------------------------------------------------- apify
@@ -208,11 +307,11 @@ def pick(d, *paths):
     return None
 
 
-def fetch_videos(music_id):
+def fetch_videos(music_id, limit=MAX_PER_SOUND):
     """Starts an Apify run, waits for it, returns all dataset items."""
     api = "https://api.apify.com/v2"
     r = requests.post(f"{api}/acts/{ACTOR}/runs", params={"token": APIFY_TOKEN},
-                      json={"musicIds": [music_id], "resultsPerPage": MAX_PER_SOUND},
+                      json={"musicIds": [music_id], "resultsPerPage": limit},
                       timeout=60)
     r.raise_for_status()
     run = r.json()["data"]
@@ -277,25 +376,37 @@ def fmt_views(v):
     return str(v)
 
 
-def scan(st):
+def scan(st, only=None):
     errors = []
     for mid, s in list(st["sounds"].items()):
+        if only is not None and mid not in only:
+            continue
+        if s.get("paused"):
+            continue
+        lim = st["max_videos"]
         try:
-            raw = fetch_videos(mid)
+            raw = fetch_videos(mid, lim + 1)
         except Exception as e:  # noqa: BLE001
-            errors.append(f"{s.get('title') or mid}: {e}")
+            errors.append(f"{name_of(mid, s)}: {e}")
             continue
         videos = [v for v in (normalize(i) for i in raw) if v]
         if not s.get("title"):
-            s["title"] = next((v["title"] for v in videos if v["title"]), "") or mid
+            s["title"] = next((v["title"] for v in videos if v["title"]), "")
 
+        s["count"] = len(videos)
+        if len(videos) > lim:
+            s["paused"] = True
+            send(f"⏸ <b>{esc(name_of(mid, s))}</b>\nПід звуком вже понад {lim} відео — "
+                 "він розкрутився, далі не стежу, щоб не витрачати гроші.\n"
+                 "Можна підняти ліміт у ⚙️ Налаштування.", markup=MENU)
+            continue
         seen = set(s.get("seen", []))
         fresh = [v for v in videos if v["id"] not in seen]
 
         if not s.get("since") or s.get("v") != 2:  # first full scan: just remember
             s["since"] = int(time.time())
             s["v"] = 2
-            send(f"🎵 <b>{esc(s['title'])}</b>\nБачу {len(videos)} відео, "
+            send(f"🎵 <b>{esc(name_of(mid, s))}</b>\nБачу {len(videos)} відео, "
                  "які вже є. Далі — тільки нові.")
         else:
             # skip old videos that just showed up in the list (not really new)
@@ -304,12 +415,12 @@ def scan(st):
             if 0 < len(new) <= 10:
                 for v in new:
                     who = f"@{esc(v['author'])}" if v["author"] else "хтось"
-                    send(f"🆕 <b>{esc(s['title'])}</b>\n{who} · 👁 {fmt_views(v['views'])}\n"
+                    send(f"🆕 <b>{esc(name_of(mid, s))}</b>\n{who} · 👁 {fmt_views(v['views'])}\n"
                          f"{esc(v['caption'])}\n{v['url']}", preview=True)
             elif new:
                 lines = [f"• @{esc(v['author'] or '?')} · 👁 {fmt_views(v['views'])}\n{v['url']}"
                          for v in new]
-                header = f"🆕 <b>{esc(s['title'])}</b> — {len(new)} нових відео\n\n"
+                header = f"🆕 <b>{esc(name_of(mid, s))}</b> — {len(new)} нових відео\n\n"
                 chunk = header
                 for line in lines:
                     if len(chunk) + len(line) > 3800:
@@ -321,7 +432,8 @@ def scan(st):
 
         s["seen"] = (s.get("seen", []) + [v["id"] for v in fresh])[-SEEN_CAP:]
 
-    st["last_scan"] = int(time.time())
+    if only is None:
+        st["last_scan"] = int(time.time())
     if errors:
         send("⚠️ Не вдалось перевірити:\n" + esc("\n".join(errors))[:3000])
 
@@ -330,12 +442,23 @@ def scan(st):
 
 def main():
     st = load_state()
-    force = handle_commands(st)
+    if st.get("menu_v") != 2:  # the "Menu" button next to the message box
+        tg("setMyCommands", {"commands": [
+            {"command": "list", "description": "Мої звуки"},
+            {"command": "check", "description": "Перевірити зараз"},
+            {"command": "add", "description": "Як додати звук"},
+            {"command": "freq", "description": "Частота перевірки"},
+            {"command": "help", "description": "Як це працює"}]})
+        st["menu_v"] = 2
+    full, only = handle_commands(st)
     save_state(st)
 
-    due = time.time() - st["last_scan"] >= SCAN_EVERY_HOURS * 3600 - 600
-    if st["sounds"] and (force or FORCE_SCAN or due):
+    due = time.time() - st["last_scan"] >= st["scan_hours"] * 3600 - 600
+    if st["sounds"] and (full or FORCE_SCAN or due):
         scan(st)
+        save_state(st)
+    elif only:
+        scan(st, only=only)
         save_state(st)
 
 
