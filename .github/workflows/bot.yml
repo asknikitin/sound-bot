@@ -1,0 +1,48 @@
+name: TikTok sound bot
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_scan:
+        description: "Check all sounds right now"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tiktok-sound-bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          SCAN_EVERY_HOURS: "6"
+          MAX_VIDEOS_PER_SOUND: "50"
+          FORCE_SCAN: ${{ github.event.inputs.force_scan == 'true' && '1' || '0' }}
+        run: python bot.py
+
+      - name: Save state
+        run: |
+          git config user.name "sound-bot"
+          git config user.email "sound-bot@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || (git commit -m "update state" && git push)
