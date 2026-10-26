@@ -473,8 +473,11 @@ def main():
             except Exception as e:  # noqa: BLE001
                 print("error:", e)
                 time.sleep(10)
-    else:  # GitHub Actions: one pass per scheduled run
+    else:  # GitHub Actions: stay awake for a few minutes so buttons answer instantly
+        end = time.time() + int(os.environ.get("LISTEN_SECONDS", "0"))
         run_once(st)
+        while time.time() < end - 5:
+            run_once(st, wait=max(1, min(50, int(end - time.time()))))
 
 
 if __name__ == "__main__":
