@@ -21,8 +21,8 @@ CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
 APIFY_TOKEN = os.environ["APIFY_TOKEN"].strip()
 
 ACTOR = os.environ.get("APIFY_ACTOR", "dami_studio~tiktok-music-scraper")
-MAX_PER_SOUND = int(os.environ.get("MAX_VIDEOS_PER_SOUND", "50"))
-SCAN_EVERY_HOURS = float(os.environ.get("SCAN_EVERY_HOURS", "6"))
+MAX_PER_SOUND = int(os.environ.get("MAX_VIDEOS", "2000"))
+SCAN_EVERY_HOURS = float(os.environ.get("SCAN_HOURS", "24"))
 FORCE_SCAN = os.environ.get("FORCE_SCAN", "0") == "1"
 
 STATE_FILE = "state.json"
@@ -36,6 +36,7 @@ HELP = (
     "Просто кинь посилання на звук (сторінка /music/...) — і я його додам.\n\n"
     "/list — список звуків\n"
     "/remove 2 — прибрати звук №2\n"
+    "/name 2 Цвіте Терен — назвати звук №2\n"
     "/check — перевірити зараз\n"
     "/help — ця підказка\n\n"
     f"Перевіряю нові відео кожні {SCAN_EVERY_HOURS:g} год."
@@ -160,6 +161,16 @@ def handle_commands(st):
             else:
                 send("Вкажи номер зі списку: /remove 2")
 
+        elif cmd == "/name":
+            parts = text.split(maxsplit=2)
+            items = sound_list(st)
+            if len(parts) == 3 and parts[1].isdigit() and 1 <= int(parts[1]) <= len(items):
+                mid = items[int(parts[1]) - 1][0]
+                st["sounds"][mid]["title"] = parts[2].strip()[:80]
+                send(f"Звук №{parts[1]} тепер: {esc(parts[2].strip())}")
+            else:
+                send("Напиши так: /name 2 Цвіте Терен")
+
         elif cmd == "/check":
             send("Перевіряю…")
             force = True
@@ -198,15 +209,32 @@ def pick(d, *paths):
 
 
 def fetch_videos(music_id):
-    r = requests.post(
-        f"https://api.apify.com/v2/acts/{ACTOR}/run-sync-get-dataset-items",
-        params={"token": APIFY_TOKEN, "timeout": 290},
-        json={"musicIds": [music_id], "resultsPerPage": MAX_PER_SOUND},
-        timeout=320,
-    )
+    """Starts an Apify run, waits for it, returns all dataset items."""
+    api = "https://api.apify.com/v2"
+    r = requests.post(f"{api}/acts/{ACTOR}/runs", params={"token": APIFY_TOKEN},
+                      json={"musicIds": [music_id], "resultsPerPage": MAX_PER_SOUND},
+                      timeout=60)
     r.raise_for_status()
-    data = r.json()
-    return data if isinstance(data, list) else []
+    run = r.json()["data"]
+    deadline = time.time() + 8 * 60
+    while run["status"] in ("READY", "RUNNING") and time.time() < deadline:
+        r = requests.get(f"{api}/actor-runs/{run['id']}",
+                         params={"token": APIFY_TOKEN, "waitForFinish": 60}, timeout=90)
+        r.raise_for_status()
+        run = r.json()["data"]
+    if run["status"] != "SUCCEEDED":
+        raise RuntimeError(f"Apify run {run['status']}")
+    items, offset = [], 0
+    while True:
+        r = requests.get(f"{api}/datasets/{run['defaultDatasetId']}/items",
+                         params={"token": APIFY_TOKEN, "offset": offset, "limit": 1000,
+                                 "clean": "true"}, timeout=120)
+        r.raise_for_status()
+        page = r.json()
+        items += page
+        if len(page) < 1000:
+            return items
+        offset += 1000
 
 
 def normalize(item):
@@ -264,9 +292,10 @@ def scan(st):
         seen = set(s.get("seen", []))
         fresh = [v for v in videos if v["id"] not in seen]
 
-        if not s.get("since"):  # first scan of this sound: just remember
+        if not s.get("since") or s.get("v") != 2:  # first full scan: just remember
             s["since"] = int(time.time())
-            send(f"🎵 <b>{esc(s['title'])}</b>\nЗапам'ятав {len(videos)} відео, "
+            s["v"] = 2
+            send(f"🎵 <b>{esc(s['title'])}</b>\nБачу {len(videos)} відео, "
                  "які вже є. Далі — тільки нові.")
         else:
             # skip old videos that just showed up in the list (not really new)
