@@ -25,7 +25,7 @@ MAX_PER_SOUND = int(os.environ.get("MAX_VIDEOS", "2000"))
 SCAN_EVERY_HOURS = float(os.environ.get("SCAN_HOURS", "24"))
 FORCE_SCAN = os.environ.get("FORCE_SCAN", "0") == "1"
 
-STATE_FILE = "state.json"
+STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 SEEN_CAP = 5000  # how many video ids to remember per sound
 TG = f"https://api.telegram.org/bot{TG_TOKEN}"
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -67,11 +67,14 @@ ADD_HOWTO = (
 # ---------------------------------------------------------------- state
 
 def load_state():
-    try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            st = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        st = {}
+    st = {}
+    for path in (STATE_FILE, "state.json"):  # on a new server, start from the repo copy
+        try:
+            with open(path, encoding="utf-8") as f:
+                st = json.load(f)
+            break
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
     st.setdefault("tg_offset", 0)
     st.setdefault("sounds", {})
     st.setdefault("last_scan", 0)
@@ -223,12 +226,12 @@ def handle_callback(st, cq):
     return []
 
 
-def handle_commands(st):
+def handle_commands(st, wait=0):
     """Processes new Telegram updates. Returns (full_scan, [sound ids to scan])."""
     full, only = False, []
     try:
         r = requests.get(f"{TG}/getUpdates",
-                         params={"offset": st["tg_offset"], "timeout": 0}, timeout=30)
+                         params={"offset": st["tg_offset"], "timeout": wait}, timeout=wait + 30)
         updates = r.json().get("result", [])
     except (requests.RequestException, ValueError) as e:
         print("getUpdates failed:", e)
@@ -440,6 +443,18 @@ def scan(st, only=None):
 
 # ---------------------------------------------------------------- main
 
+def run_once(st, wait=0):
+    full, only = handle_commands(st, wait)
+    save_state(st)
+    due = time.time() - st["last_scan"] >= st["scan_hours"] * 3600 - 600
+    if st["sounds"] and (full or FORCE_SCAN or due):
+        scan(st)
+        save_state(st)
+    elif only:
+        scan(st, only=only)
+        save_state(st)
+
+
 def main():
     st = load_state()
     if st.get("menu_v") != 2:  # the "Menu" button next to the message box
@@ -450,16 +465,16 @@ def main():
             {"command": "freq", "description": "Частота перевірки"},
             {"command": "help", "description": "Як це працює"}]})
         st["menu_v"] = 2
-    full, only = handle_commands(st)
-    save_state(st)
-
-    due = time.time() - st["last_scan"] >= st["scan_hours"] * 3600 - 600
-    if st["sounds"] and (full or FORCE_SCAN or due):
-        scan(st)
-        save_state(st)
-    elif only:
-        scan(st, only=only)
-        save_state(st)
+    if os.environ.get("LOOP") == "1":  # always-on server / own computer: instant replies
+        tg("deleteWebhook", {})
+        while True:
+            try:
+                run_once(st, wait=50)
+            except Exception as e:  # noqa: BLE001
+                print("error:", e)
+                time.sleep(10)
+    else:  # GitHub Actions: one pass per scheduled run
+        run_once(st)
 
 
 if __name__ == "__main__":
